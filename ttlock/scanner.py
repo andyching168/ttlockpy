@@ -30,6 +30,7 @@ class DiscoveredLock:
     has_events: bool
     is_setting_mode: bool  # True when factory-fresh / in pairing mode
     protocol: LockProtocol = field(default_factory=LockProtocol)
+    device: BLEDevice | None = None  # Runtime BLE device handle (not persisted)
 
 
 def _parse_manufacturer_data(company_id: int, payload: bytes) -> dict | None:
@@ -129,6 +130,7 @@ def _device_from_advertisement(
         has_events      = parsed["has_events"],
         is_setting_mode = parsed["is_setting_mode"],
         protocol        = proto,
+        device          = device,
     )
 
 

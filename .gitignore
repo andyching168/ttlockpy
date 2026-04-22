@@ -107,3 +107,11 @@ package-lock.json
 lockData.json
 docs/capture/
 myEnv.sh
+
+lock.json
+
+# Pycache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd

@@ -13,6 +13,10 @@ Usage:
   python ttlock.py autolock get  --lock lock.json
   python ttlock.py autolock set  --lock lock.json --seconds 30
 
+  python ttlock.py remote status --lock lock.json
+  python ttlock.py remote on     --lock lock.json
+  python ttlock.py remote off    --lock lock.json
+
   python ttlock.py passage list   --lock lock.json
   python ttlock.py passage add    --lock lock.json --type weekly --day 0 \\
                                   --start 0800 --end 2000
@@ -46,6 +50,7 @@ Usage:
 import argparse
 import asyncio
 import json
+import os
 import sys
 
 from ttlock import TTLock, discover_locks, listen_for_events
@@ -98,6 +103,9 @@ async def cmd_pair(args) -> None:
 
     # If no protocol is known yet, try to discover first
     proto_type, proto_ver, scene = 5, 3, 1  # safe V3 defaults
+    selected_address = args.address
+    selected_mac = ""
+    selected_name = "TTLock"
     if args.discover:
         print("Scanning to detect protocol parameters…")
         found = await discover_locks(timeout=args.scan_timeout)
@@ -107,11 +115,16 @@ async def cmd_pair(args) -> None:
                 proto_type = lock.protocol.protocol_type
                 proto_ver  = lock.protocol.protocol_version
                 scene      = lock.protocol.scene
+                selected_address = lock.address
+                selected_mac = lock.mac
+                selected_name = lock.name
                 print(f"  Protocol {proto_type}.{proto_ver}  scene={scene}")
                 break
 
     data = LockData(
-        address          = args.address,
+        address          = selected_address,
+        name             = selected_name,
+        mac              = selected_mac,
         protocol_type    = proto_type,
         protocol_version = proto_ver,
         scene            = scene,
@@ -157,10 +170,34 @@ async def cmd_status(args) -> None:
     lock = _load_lock(args.lock)
     print(f"Connecting to {lock.data.address}…")
     async with lock:
-        status = await lock.get_locked_status()
-    name = "UNLOCKED" if status == LockedStatus.UNLOCKED else \
-           "LOCKED"   if status == LockedStatus.LOCKED   else "UNKNOWN"
-    print(f"Status: {name}")
+        status_ok = False
+        last_err = None
+        for i in range(3):
+            try:
+                status = await lock.get_locked_status()
+                status_ok = True
+                break
+            except Exception as e:
+                last_err = e
+                msg = str(e)
+                if "Command 0x14 failed" not in msg:
+                    raise
+                if i < 2:
+                    print("⚠️ Status query not ready, retrying…")
+                    try:
+                        await lock.disconnect()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(0.6)
+                    await lock.connect(timeout=20.0)
+                    await asyncio.sleep(0.4)
+
+        if not status_ok and last_err is not None:
+            raise last_err
+
+        name = "UNLOCKED" if status == LockedStatus.UNLOCKED else \
+               "LOCKED"   if status == LockedStatus.LOCKED   else "UNKNOWN"
+        print(f"Status: {name}")
     _save_lock(lock, args.lock)
 
 
@@ -377,6 +414,27 @@ async def cmd_log(args) -> None:
     _print_json(entries)
 
 
+# -- Remote Unlock -----------------------------------------------------------
+
+async def cmd_remote_status(args) -> None:
+    lock = _load_lock(args.lock)
+    async with lock:
+        enabled = await lock.get_remote_unlock_status()
+    print(f"Remote unlock (heartbeat polling) is {'ENABLED' if enabled else 'DISABLED'}")
+
+async def cmd_remote_on(args) -> None:
+    lock = _load_lock(args.lock)
+    async with lock:
+        await lock.set_remote_unlock(True)
+    print("Remote unlock ENABLED.")
+
+async def cmd_remote_off(args) -> None:
+    lock = _load_lock(args.lock)
+    async with lock:
+        await lock.set_remote_unlock(False)
+    print("Remote unlock DISABLED.")
+
+
 # ---------------------------------------------------------------------------
 # Argument parser
 # ---------------------------------------------------------------------------
@@ -386,6 +444,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="ttlock.py",
         description="Control TTLock BLE smart locks",
     )
+    p.add_argument("--debug", action="store_true",
+                   help="Enable verbose protocol/debug logs")
     sub = p.add_subparsers(dest="command", required=True)
 
     # discover
@@ -421,8 +481,14 @@ def build_parser() -> argparse.ArgumentParser:
     al_sub = al.add_subparsers(dest="subcommand", required=True)
     al_get = al_sub.add_parser("get"); al_get.add_argument("--lock", default="lock.json")
     al_set = al_sub.add_parser("set")
-    al_set.add_argument("--lock", default="lock.json")
     al_set.add_argument("--seconds", type=int, required=True)
+
+    # remote
+    rm = sub.add_parser("remote", help="Remote unlock polling (heartbeats)")
+    rm_sub = rm.add_subparsers(dest="subcommand", required=True)
+    for cmd in ("status", "on", "off"):
+        s = rm_sub.add_parser(cmd)
+        s.add_argument("--lock", default="lock.json")
 
     # passage
     pm = sub.add_parser("passage", help="Passage mode")
@@ -554,12 +620,18 @@ _DISPATCH = {
     ("fingerprint", "update"): cmd_fp_update,
     ("fingerprint", "delete"): cmd_fp_delete,
     ("fingerprint", "clear"):  cmd_fp_clear,
+    ("remote",      "status"): cmd_remote_status,
+    ("remote",          "on"): cmd_remote_on,
+    ("remote",         "off"): cmd_remote_off,
 }
 
 
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
+
+    if args.debug:
+        os.environ["TTLOCK_DEBUG"] = "1"
 
     key = (args.command, getattr(args, "subcommand", None))
     handler = _DISPATCH.get(key) or _DISPATCH.get(args.command)

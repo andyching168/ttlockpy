@@ -19,11 +19,12 @@ import asyncio
 import json
 import os
 import random
+import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from bleak import BleakClient
+from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 
 from .const import (
@@ -67,12 +68,35 @@ class LockData:
         return DEFAULT_AES_KEY
 
     def get_protocol(self) -> LockProtocol:
+        # Keep protocol fields aligned with ttlock-sdk-js LockVersion mapping.
+        # Some locks advertise scene=2, but commands are accepted only with the
+        # canonical scene for that protocol family (e.g. V3 -> scene 1).
+        protocol_type = self.protocol_type
+        protocol_version = self.protocol_version
+        scene = self.scene
+        group_id = 1
+        org_id = 1
+
+        if protocol_type == 5 and protocol_version == 3:
+            # V3 car is scene 7; regular V3 uses scene 1.
+            scene = 7 if scene == 7 else 1
+        elif protocol_type == 5 and protocol_version in (1, 4):
+            scene = 1
+        elif protocol_type == 10 and protocol_version == 1:
+            scene = 7
+        elif protocol_type == 11 and protocol_version == 1:
+            scene = 1
+        elif protocol_type == 3:
+            scene = 0
+            group_id = 0
+            org_id = 0
+
         return LockProtocol(
-            protocol_type    = self.protocol_type,
-            protocol_version = self.protocol_version,
-            scene            = self.scene,
-            group_id         = 1,
-            org_id           = 1,
+            protocol_type    = protocol_type,
+            protocol_version = protocol_version,
+            scene            = scene,
+            group_id         = group_id,
+            org_id           = org_id,
         )
 
 
@@ -93,6 +117,11 @@ class TTLock:
         self._rx_buffer = bytearray()
         self._response_queue: asyncio.Queue = asyncio.Queue()
         self.battery: int = data.battery
+        self.debug: bool = os.getenv("TTLOCK_DEBUG", "0") == "1"
+
+    def _dbg(self, msg: str) -> None:
+        if self.debug:
+            print(f"[TTLOCK-DEBUG] {msg}")
 
     # ------------------------------------------------------------------
     # Factory helpers
@@ -117,18 +146,107 @@ class TTLock:
     # ------------------------------------------------------------------
 
     async def connect(self, timeout: float = 15.0) -> None:
-        """Connect to the lock and subscribe to notifications."""
-        self._client = BleakClient(self.data.address, timeout=timeout)
-        await self._client.connect()
-        await self._client.start_notify(NOTIFY_CHAR_UUID, self._on_notification)
+        """Connect to the lock and subscribe to notifications.
+
+        On macOS/CoreBluetooth, service discovery can intermittently drop right
+        after connection. We retry with a short scan fallback to resolve the
+        current BLEDevice reference before giving up.
+        """
+        last_error: Exception | None = None
+        
+        # Reset internal buffers on fresh connect attempt
+        self._rx_buffer.clear()
+        while not self._response_queue.empty():
+            self._response_queue.get_nowait()
+
+        for attempt in range(3):
+            try:
+                self._dbg(
+                    f"connect attempt={attempt+1} addr={self.data.address} "
+                    f"mac={self.data.mac or '-'} name={self.data.name or '-'}"
+                )
+                # Refresh BLEDevice reference when possible. This helps with
+                # transient CoreBluetooth "disconnected" during service discovery.
+                device = await BleakScanner.find_device_by_address(
+                    self.data.address, timeout=min(timeout, 5.0)
+                )
+                client_target = device if device is not None else self.data.address
+
+                if device is None:
+                    # Address can become stale on some platforms (notably macOS).
+                    # The lock may be sleeping and not advertising continuously.
+                    # We poll with longer scan windows to catch the lock's advertisement
+                    # bursts (lock typically advertises once per second when in remote mode).
+                    self._dbg(f"device not found, polling for lock to advertise...")
+                    discovered: DiscoveredLock | None = None
+                    poll_count = max(2, int(timeout / 3))
+                    for i in range(poll_count):
+                        try:
+                            from .scanner import discover_locks
+                            found = await discover_locks(timeout=3.0)
+                            mac_upper = self.data.mac.upper() if self.data.mac else ""
+                            by_mac = next(
+                                (d for d in found if mac_upper and d.mac.upper() == mac_upper),
+                                None,
+                            )
+                            by_name = next(
+                                (d for d in found if self.data.name and d.name == self.data.name),
+                                None,
+                            )
+                            discovered = by_mac or by_name
+                            if discovered is not None:
+                                self._dbg(f"lock found on poll {i+1}/{poll_count}")
+                                break
+                        except Exception as e:
+                            self._dbg(f"scan poll {i+1} failed: {e}")
+                        # Wait a bit between scans to let lock send another advertisement burst
+                        if i + 1 < poll_count:
+                            await asyncio.sleep(1.5)
+
+                    if discovered is not None:
+                        self._dbg(
+                            f"refresh addr via scan old={self.data.address} new={discovered.address}"
+                        )
+                        self.data.address = discovered.address
+                        if discovered.mac:
+                            self.data.mac = discovered.mac
+                        device = discovered.device
+                        client_target = device if device is not None else self.data.address
+                    else:
+                        self._dbg("lock did not wake up within timeout")
+
+                self._client = BleakClient(client_target, timeout=timeout)
+                await self._client.connect()
+                try:
+                    await self._client.read_gatt_char(NOTIFY_CHAR_UUID)
+                except Exception:
+                    pass
+                await self._client.start_notify(NOTIFY_CHAR_UUID, self._on_notification)
+                self._dbg("connect success + notify subscribed")
+                return
+            except Exception as error:
+                self._dbg(f"connect attempt={attempt+1} failed: {error}")
+                last_error = error
+                try:
+                    await self.disconnect()
+                except Exception:
+                    pass
+                if attempt < 2:
+                    await asyncio.sleep(0.6)
+
+        raise BleakError(f"Failed to connect after retries: {last_error}")
 
     async def disconnect(self) -> None:
-        if self._client and self._client.is_connected:
+        if self._client:
             try:
-                await self._client.stop_notify(NOTIFY_CHAR_UUID)
+                if self._client.is_connected:
+                    await self._client.stop_notify(NOTIFY_CHAR_UUID)
             except Exception:
                 pass
-            await self._client.disconnect()
+            try:
+                await self._client.disconnect()
+            except Exception:
+                pass
         self._client = None
 
     @property
@@ -152,6 +270,7 @@ class TTLock:
         if self._rx_buffer[-2:] == b"\r\n":
             frame = bytes(self._rx_buffer)
             self._rx_buffer.clear()
+            self._dbg(f"RX frame len={len(frame)} hex={frame.hex()}")
             self._response_queue.put_nowait(frame)
 
     async def _send_command(
@@ -161,37 +280,76 @@ class TTLock:
         aes_key: bytes | None = None,
         wait_response: bool = True,
         ignore_crc: bool = False,
+        require_success: bool = True,
     ) -> dict | None:
         """Build, send, and optionally await a lock command."""
         proto = self.data.get_protocol()
         packet = build_packet(proto, int(cmd_type), payload, aes_key)
+        cmd_name = cmd_type.name if hasattr(cmd_type, "name") else f"0x{int(cmd_type):02X}"
+        self._dbg(
+            f"TX {cmd_name} scene={proto.scene} group={proto.group_id} org={proto.org_id} "
+            f"payload_len={len(payload)} packet_len={len(packet)}"
+        )
 
-        for chunk in split_into_chunks(packet):
-            await self._client.write_gatt_char(WRITE_CHAR_UUID, chunk,
-                                               response=False)
+        # Clear any stale responses left over from previous commands
+        while not self._response_queue.empty():
+            self._response_queue.get_nowait()
 
-        if not wait_response:
-            return None
+        for attempt in range(3):
+            # Drain any stale notifications that arrived before we sent this command.
+            while not self._response_queue.empty():
+                self._response_queue.get_nowait()
 
-        # Wait for the lock to reply (with retry on bad CRC)
-        for _attempt in range(3):
+            started = time.monotonic()
+            for chunk in split_into_chunks(packet):
+                self._dbg(f"TX chunk attempt={attempt+1} len={len(chunk)} hex={chunk.hex()}")
+                await self._client.write_gatt_char(WRITE_CHAR_UUID, chunk, response=True)
+
+            if not wait_response:
+                return None
+
             try:
-                frame = await asyncio.wait_for(
-                    self._response_queue.get(), timeout=5.0
-                )
+                while True:
+                    time_left = 8.0 - (time.monotonic() - started)
+                    if time_left <= 0:
+                        raise asyncio.TimeoutError()
+                    
+                    frame = await asyncio.wait_for(self._response_queue.get(), timeout=time_left)
+                    parsed = parse_response(frame, aes_key=aes_key, ignore_crc=ignore_crc)
+                    elapsed_ms = int((time.monotonic() - started) * 1000)
+                    
+                    self._dbg(
+                        f"RX parsed {cmd_name} attempt={attempt+1} elapsed={elapsed_ms}ms "
+                        f"resp=0x{parsed['response']:02X} crc_ok={parsed['crc_ok']} data_len={len(parsed['data'])}"
+                    )
+                    
+                    if parsed["cmd_type"] in (int(cmd_type), 0x54):
+                        break
+                    else:
+                        self._dbg(f"Ignoring unrelated frame (cmd_type=0x{parsed['cmd_type']:02X})")
             except asyncio.TimeoutError:
+                self._dbg(f"RX timeout {cmd_name} attempt={attempt+1}")
+                if attempt < 2:
+                    await asyncio.sleep(0.2)
+                    continue
                 raise TimeoutError(f"No response to command 0x{cmd_type:02X}")
 
-            parsed = parse_response(frame, aes_key=aes_key,
-                                    ignore_crc=ignore_crc)
-            if parsed["crc_ok"] or ignore_crc:
-                if parsed["response"] != CommandResponse.SUCCESS:
-                    raise RuntimeError(
-                        f"Command 0x{cmd_type:02X} failed "
-                        f"(response=0x{parsed['response']:02X})"
-                    )
-                return parsed
-        raise RuntimeError(f"Command 0x{cmd_type:02X}: persistent CRC errors")
+            if not parsed["crc_ok"] and not ignore_crc:
+                if attempt < 2:
+                    self._dbg(f"CRC bad for {cmd_name}, retrying")
+                    await asyncio.sleep(0.2)
+                    continue
+                raise RuntimeError(f"Command 0x{cmd_type:02X}: persistent CRC errors")
+
+            if require_success and parsed["response"] != CommandResponse.SUCCESS:
+                raise RuntimeError(
+                    f"Command 0x{cmd_type:02X} failed "
+                    f"(response=0x{parsed['response']:02X})"
+                )
+
+            return parsed
+
+        raise RuntimeError(f"Command 0x{cmd_type:02X}: no valid response after retries")
 
     async def wait_for_notification(self, timeout: float = 30.0) -> dict | None:
         """Block until the lock sends an unsolicited notification (e.g. card scan)."""
@@ -249,6 +407,7 @@ class TTLock:
             cmd.build_init(),
             aes_key=None,
             ignore_crc=True,
+            require_success=False,
         )
 
         # Step 2: Get the lock's AES key (use default key)
@@ -358,14 +517,33 @@ class TTLock:
 
     async def get_locked_status(self) -> LockedStatus:
         """Query the lock for its current locked/unlocked state."""
-        resp = await self._send_command(
-            CommandType.SEARCH_BICYCLE_STATUS,
-            cmd.build_search_status(),
-            aes_key=self.data.get_aes_key(),
+        last_resp: dict | None = None
+        for attempt in range(2):
+            # Auth step first to wake up the lock before querying status.
+            await self._auth_check_user_time()
+            resp = await self._send_command(
+                CommandType.SEARCH_BICYCLE_STATUS,
+                cmd.build_search_status(),
+                aes_key=self.data.get_aes_key(),
+                require_success=False,
+            )
+            last_resp = resp
+
+            status = cmd.parse_search_status(resp["data"])
+            if status != LockedStatus.UNKNOWN:
+                self.data.locked_status = int(status)
+                return status
+
+            self._dbg(
+                f"status query invalid resp=0x{resp['response']:02X} data={resp['data'].hex()} attempt={attempt+1}/2"
+            )
+            if attempt == 0:
+                await asyncio.sleep(0.3)
+
+        raise RuntimeError(
+            f"Command 0x{int(CommandType.SEARCH_BICYCLE_STATUS):02X} failed "
+            f"(response=0x{last_resp['response']:02X})"
         )
-        status = cmd.parse_search_status(resp["data"])
-        self.data.locked_status = int(status)
-        return status
 
     # ------------------------------------------------------------------
     # Auto-lock
@@ -468,7 +646,11 @@ class TTLock:
                 cmd.build_list_passcodes(sequence),
                 aes_key=self.data.get_aes_key(),
                 ignore_crc=True,
+                require_success=False,   # 0x00 = no passcodes or empty page
             )
+            # resp may be None on zero-data frames; treat as end of list
+            if resp is None or len(resp["data"]) < 4:
+                break
             next_seq, codes = cmd.parse_passcodes(resp["data"])
             all_codes.extend(codes)
             if next_seq == 0 or not codes:
@@ -482,13 +664,15 @@ class TTLock:
         pwd_type: KeyboardPwdType = KeyboardPwdType.PERMANENT,
         start_date: str = "000101000000",
         end_date: str   = "991231235900",
-    ) -> None:
-        """Add a PIN code."""
-        await self._send_command(
+    ) -> bool:
+        """Add a PIN code. Returns True on success."""
+        await self._auth_admin_login()
+        resp = await self._send_command(
             CommandType.MANAGE_KEYBOARD_PASSWORD,
             cmd.build_add_passcode(pwd_type, passcode, start_date, end_date),
             aes_key=self.data.get_aes_key(),
         )
+        return True
 
     async def update_passcode(
         self,
@@ -499,6 +683,7 @@ class TTLock:
         end_date: str   = "991231235900",
     ) -> None:
         """Update an existing PIN code."""
+        await self._auth_admin_login()
         await self._send_command(
             CommandType.MANAGE_KEYBOARD_PASSWORD,
             cmd.build_update_passcode(pwd_type, old_passcode, new_passcode,
@@ -512,6 +697,7 @@ class TTLock:
         pwd_type: KeyboardPwdType = KeyboardPwdType.PERMANENT,
     ) -> None:
         """Delete one PIN code."""
+        await self._auth_admin_login()
         await self._send_command(
             CommandType.MANAGE_KEYBOARD_PASSWORD,
             cmd.build_delete_passcode(pwd_type, passcode),
@@ -520,6 +706,7 @@ class TTLock:
 
     async def clear_passcodes(self) -> None:
         """Delete all PIN codes from the lock."""
+        await self._auth_admin_login()
         await self._send_command(
             CommandType.MANAGE_KEYBOARD_PASSWORD,
             cmd.build_clear_passcodes(),
@@ -541,7 +728,10 @@ class TTLock:
                 cmd.build_list_ic_cards(sequence),
                 aes_key=self.data.get_aes_key(),
                 ignore_crc=True,
+                require_success=False,
             )
+            if resp is None or resp["response"] == 0x00 or len(resp["data"]) < 2:
+                break
             next_seq, cards = cmd.parse_ic_cards(resp["data"])
             all_cards.extend(cards)
             if next_seq == 0 or not cards:
@@ -558,6 +748,7 @@ class TTLock:
 
         Returns the scanned card number string.
         """
+        await self._auth_admin_login()
         resp = await self._send_command(
             CommandType.IC_MANAGE,
             cmd.build_add_ic_card(),
@@ -577,6 +768,7 @@ class TTLock:
         self, card_number: str,
         start_date: str, end_date: str,
     ) -> None:
+        await self._auth_admin_login()
         await self._send_command(
             CommandType.IC_MANAGE,
             cmd.build_update_ic_card(card_number, start_date, end_date),
@@ -584,6 +776,7 @@ class TTLock:
         )
 
     async def delete_ic_card(self, card_number: str) -> None:
+        await self._auth_admin_login()
         await self._send_command(
             CommandType.IC_MANAGE,
             cmd.build_delete_ic_card(card_number),
@@ -591,6 +784,7 @@ class TTLock:
         )
 
     async def clear_ic_cards(self) -> None:
+        await self._auth_admin_login()
         await self._send_command(
             CommandType.IC_MANAGE,
             cmd.build_clear_ic_cards(),
@@ -612,7 +806,10 @@ class TTLock:
                 cmd.build_list_fingerprints(sequence),
                 aes_key=self.data.get_aes_key(),
                 ignore_crc=True,
+                require_success=False,
             )
+            if resp is None or resp["response"] == 0x00 or len(resp["data"]) < 2:
+                break
             next_seq, fps = cmd.parse_fingerprints(resp["data"])
             all_fps.extend(fps)
             if next_seq == 0 or not fps:
@@ -630,6 +827,7 @@ class TTLock:
         Prompts the user to scan their finger multiple times.
         Returns the fingerprint ID string on success.
         """
+        await self._auth_admin_login()
         resp = await self._send_command(
             CommandType.FR_MANAGE,
             cmd.build_add_fingerprint(),
@@ -655,6 +853,7 @@ class TTLock:
         self, fp_number: str,
         start_date: str, end_date: str,
     ) -> None:
+        await self._auth_admin_login()
         await self._send_command(
             CommandType.FR_MANAGE,
             cmd.build_update_fingerprint(fp_number, start_date, end_date),
@@ -662,6 +861,7 @@ class TTLock:
         )
 
     async def delete_fingerprint(self, fp_number: str) -> None:
+        await self._auth_admin_login()
         await self._send_command(
             CommandType.FR_MANAGE,
             cmd.build_delete_fingerprint(fp_number),
@@ -669,6 +869,7 @@ class TTLock:
         )
 
     async def clear_fingerprints(self) -> None:
+        await self._auth_admin_login()
         await self._send_command(
             CommandType.FR_MANAGE,
             cmd.build_clear_fingerprints(),
@@ -688,3 +889,28 @@ class TTLock:
         )
         _, entries = cmd.parse_operation_log(resp["data"])
         return entries
+        
+    # ------------------------------------------------------------------
+    # Remote Unlock (Heartbeat Polling)
+    # ------------------------------------------------------------------
+
+    async def get_remote_unlock_status(self) -> bool:
+        """Check if Remote Unlock feature is currently enabled on the lock."""
+        await self._auth_admin_login()
+        resp = await self._send_command(
+            CommandType.CONTROL_REMOTE_UNLOCK,
+            cmd.build_get_remote_unlock(),
+            aes_key=self.data.get_aes_key(),
+        )
+        return cmd.parse_remote_unlock(resp["data"])
+        
+    async def set_remote_unlock(self, enabled: bool) -> None:
+        """Enable or disable Remote Unlock.
+        When enabled, the lock wakes up periodically to accept connections.
+        """
+        await self._auth_admin_login()
+        await self._send_command(
+            CommandType.CONTROL_REMOTE_UNLOCK,
+            cmd.build_set_remote_unlock(enabled),
+            aes_key=self.data.get_aes_key(),
+        )

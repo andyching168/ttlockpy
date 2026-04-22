@@ -118,8 +118,8 @@ def build_check_admin(admin_ps: int) -> bytes:
     # Layout: adminPs(4 bytes) | lockFlagPos(4 bytes, high byte overlaps) | uid(4 bytes)
     # In practice uid=0, lockFlagPos=0, which simplifies to just adminPs padded.
     data = bytearray(11)
-    struct.pack_into(">I", data, 0, admin_ps)      # adminPs at 0
     struct.pack_into(">I", data, 3, 0)             # lockFlagPos at 3 (overlapping)
+    struct.pack_into(">I", data, 0, admin_ps)      # adminPs at 0
     struct.pack_into(">I", data, 7, 0)             # uid at 7
     return bytes(data)
 
@@ -204,9 +204,9 @@ def build_search_status() -> bytes:
 
 def parse_search_status(data: bytes) -> LockedStatus:
     """Return LockedStatus from a SEARCH_BICYCLE_STATUS response."""
-    if len(data) < 2:
+    if not data:
         return LockedStatus.UNKNOWN
-    raw = data[1]
+    raw = data[0]
     if raw == 0:
         return LockedStatus.LOCKED
     elif raw == 1:
@@ -268,7 +268,9 @@ def build_add_passcode(
     end_b   = _dt_to_bytes(end_date[:10])
 
     buf = bytes([PwdOperateType.ADD, int(pwd_type), len(code)]) + code + start_b
-    if pwd_type != KeyboardPwdType.PERMANENT:
+    if pwd_type == KeyboardPwdType.PERMANENT:
+        buf += bytes(5)
+    else:
         buf += end_b
     return buf
 
@@ -403,7 +405,7 @@ def parse_ic_card_add(data: bytes) -> tuple[str, int]:
     """Parse an IC add response.  Returns (card_number_str, status_code)."""
     if len(data) < 3:
         return "", 0
-    status = data[1]
+    status = data[2]
     if status == ICOperate.STATUS_ADD_SUCCESS:
         remaining = len(data) - 3
         if remaining == 4 or (remaining == 8 and data[-4:] == b"\xff\xff\xff\xff"):
@@ -473,7 +475,7 @@ def parse_fingerprint_add(data: bytes) -> tuple[str, int]:
     """Parse a fingerprint ADD response.  Returns (fp_number_str, status)."""
     if len(data) < 3:
         return "", 0
-    status = data[1]
+    status = data[2]
     if status == ICOperate.STATUS_ADD_SUCCESS:
         raw = b"\x00\x00" + data[3:9]
         fp = struct.unpack(">Q", raw)[0]
@@ -615,3 +617,26 @@ def parse_operation_log(data: bytes) -> tuple[int, list[dict]]:
             idx += remaining
         logs.append(entry)
     return sequence, logs
+
+# ---------------------------------------------------------------------------
+# Remote Unlock
+# ---------------------------------------------------------------------------
+
+def build_get_remote_unlock() -> bytes:
+    """Check if the remote unlock (heartbeat polling) feature is enabled."""
+    OP_TYPE_SEARCH = 1
+    return bytes([OP_TYPE_SEARCH])
+
+def build_set_remote_unlock(enabled: bool) -> bytes:
+    """Enable or disable remote unlock polling (1=enabled, 0=disabled)."""
+    OP_TYPE_MODIFY = 2
+    val = 1 if enabled else 0
+    return bytes([OP_TYPE_MODIFY, val])
+
+def parse_remote_unlock(data: bytes) -> bool:
+    """Parse a CONTROL_REMOTE_UNLOCK response and return if it is currently enabled."""
+    if len(data) >= 3 and data[1] == 1:  # SEARCH
+        return data[2] == 1
+    # Note: For MODIFY, the lock doesn't always return the value in the response data, 
+    # but resp=0x01 indicates success.
+    return False
