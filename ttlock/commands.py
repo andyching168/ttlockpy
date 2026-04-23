@@ -581,6 +581,29 @@ def build_get_operation_log(sequence: int = 0xFFFF) -> bytes:
     return struct.pack(">H", sequence)
 
 
+def _parse_passcode_from_log(data: bytes, idx: int) -> tuple[str, int]:
+    pwd_len = data[idx]; idx += 1
+    password = data[idx:idx+pwd_len].decode("ascii", errors="replace"); idx += pwd_len
+    pwd_len = data[idx]; idx += 1
+    new_password = data[idx:idx+pwd_len].decode("ascii", errors="replace"); idx += pwd_len
+    return password, idx
+
+
+def _parse_ic_card_from_log(data: bytes, idx: int) -> tuple[str, int]:
+    remaining = len(data) - idx
+    if remaining == 4:
+        card_number = str(struct.unpack(">I", data[idx:idx+4])[0]); idx += 4
+    else:
+        card_number = str(struct.unpack(">Q", data[idx:idx+8])[0]); idx += 8
+    return card_number, idx
+
+
+def _parse_fingerprint_from_log(data: bytes, idx: int) -> tuple[str, int]:
+    raw = b"\x00\x00" + data[idx:idx+6]
+    fp_number = str(struct.unpack(">Q", raw)[0]); idx += 6
+    return fp_number, idx
+
+
 def parse_operation_log(data: bytes) -> tuple[int, list[dict]]:
     """Parse a GET_OPERATE_LOG response."""
     if len(data) < 2:
@@ -610,11 +633,23 @@ def parse_operation_log(data: bytes) -> tuple[int, list[dict]]:
             "operate_date": operate_date,
             "battery": battery,
         }
-        # Remaining bytes in this record are type-dependent; just store as hex
         remaining = rec_len - (idx - rec_start)
-        if remaining > 0 and idx + remaining <= len(data):
-            entry["extra"] = data[idx:idx+remaining].hex()
-            idx += remaining
+
+        if rec_type == 4 or rec_type == 5 or rec_type == 6 or rec_type == 7 or \
+           rec_type == 8 or rec_type == 9 or rec_type == 10 or rec_type == 11 or \
+           rec_type == 12 or rec_type == 13 or rec_type == 34 or rec_type == 38:
+            if remaining >= 2:
+                password, idx = _parse_passcode_from_log(data, idx)
+                entry["credential_id"] = password
+        elif rec_type == 17 or rec_type == 25 or rec_type == 35 or rec_type == 39:
+            if remaining > 0:
+                card_number, idx = _parse_ic_card_from_log(data, idx)
+                entry["credential_id"] = card_number
+        elif rec_type == 20 or rec_type == 22 or rec_type == 33 or rec_type == 40:
+            if remaining >= 6:
+                fp_number, idx = _parse_fingerprint_from_log(data, idx)
+                entry["credential_id"] = fp_number
+
         logs.append(entry)
     return sequence, logs
 

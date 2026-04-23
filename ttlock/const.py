@@ -2,12 +2,10 @@
 
 from enum import IntEnum
 
-# BLE service and characteristic UUIDs
 TTLOCK_SERVICE_UUID = "00001910-0000-1000-8000-00805f9b34fb"
 WRITE_CHAR_UUID = "0000fff2-0000-1000-8000-00805f9b34fb"
 NOTIFY_CHAR_UUID = "0000fff4-0000-1000-8000-00805f9b34fb"
 
-# Default AES key used during pairing (before lock's own key is obtained)
 DEFAULT_AES_KEY = bytes([
     0x98, 0x76, 0x23, 0xE8,
     0xA9, 0x23, 0xA1, 0xBB,
@@ -15,40 +13,39 @@ DEFAULT_AES_KEY = bytes([
     0x78, 0x12, 0x45, 0x88,
 ])
 
-# Packet framing
 PACKET_HEADER = bytes([0x7F, 0x5A])
 PACKET_TERMINATOR = b"\r\n"
-BLE_MTU = 20            # max bytes per BLE write
-APP_COMMAND = 0xAA      # encrypt byte we send to the lock
+BLE_MTU = 20
+APP_COMMAND = 0xAA
 
 
 class CommandType(IntEnum):
-    INITIALIZATION = 0x45           # Pairing step 1
-    GET_AES_KEY = 0x19              # Pairing step 2: get lock AES key
-    ADD_ADMIN = 0x56                # Pairing step 3: register admin credentials
-    CHECK_ADMIN = 0x41              # Auth step 1 (older protocol)
-    CHECK_RANDOM = 0x30             # Auth step 2 (older protocol)
-    CHECK_USER_TIME = 0x55          # Auth (V3 protocol): send validity window
-    SET_ADMIN_KEYBOARD_PWD = 0x53   # Set admin PIN code
-    GET_ADMIN_CODE = 0x65           # Read admin PIN code
-    UNLOCK = 0x47                   # Unlock
-    FUNCTION_LOCK = 0x58            # Lock
-    TIME_CALIBRATE = 0x43           # Synchronise lock clock
-    MANAGE_KEYBOARD_PASSWORD = 0x03 # Add / edit / delete PIN codes
-    PWD_LIST = 0x07                 # List PIN codes
-    GET_OPERATE_LOG = 0x25          # Read operation log
-    RESET_LOCK = 0x52               # Factory reset
-    SEARCH_DEVICE_FEATURE = 0x01    # Query lock capabilities (feature bitmap)
-    IC_MANAGE = 0x05                # IC card operations
-    FR_MANAGE = 0x06                # Fingerprint operations
-    AUTO_LOCK_MANAGE = 0x36         # Get / set auto-lock timeout
-    READ_DEVICE_INFO = 0x90         # Read device info string
-    CONTROL_REMOTE_UNLOCK = 0x37    # Enable / disable remote unlock
-    AUDIO_MANAGE = 0x62             # Enable / disable lock beeps
-    CONFIGURE_PASSAGE_MODE = 0x66   # Passage mode management
-    SHOW_PASSWORD = 0x59            # Show / hide passcode on keypad
-    OPERATE_FINISHED = 0x57         # Signal end of multi-step operation
-    SEARCH_BICYCLE_STATUS = 0x14    # Poll lock/unlock status
+    INITIALIZATION = 0x45
+    GET_AES_KEY = 0x19
+    ADD_ADMIN = 0x56
+    CHECK_ADMIN = 0x41
+    CHECK_RANDOM = 0x30
+    CHECK_USER_TIME = 0x55
+    SET_ADMIN_KEYBOARD_PWD = 0x53
+    GET_ADMIN_CODE = 0x65
+    UNLOCK = 0x47
+    FUNCTION_LOCK = 0x58
+    TIME_CALIBRATE = 0x43
+    MANAGE_KEYBOARD_PASSWORD = 0x03
+    PWD_LIST = 0x07
+    GET_OPERATE_LOG = 0x25
+    RESET_LOCK = 0x52
+    SEARCH_DEVICE_FEATURE = 0x01
+    IC_MANAGE = 0x05
+    FR_MANAGE = 0x06
+    AUTO_LOCK_MANAGE = 0x36
+    READ_DEVICE_INFO = 0x90
+    CONTROL_REMOTE_UNLOCK = 0x37
+    AUDIO_MANAGE = 0x62
+    CONFIGURE_PASSAGE_MODE = 0x66
+    SHOW_PASSWORD = 0x59
+    OPERATE_FINISHED = 0x57
+    SEARCH_BICYCLE_STATUS = 0x14
 
 
 class CommandResponse(IntEnum):
@@ -63,17 +60,17 @@ class LockedStatus(IntEnum):
 
 
 class KeyboardPwdType(IntEnum):
-    PERMANENT = 1   # Always valid
-    COUNT = 2       # Limited number of uses
-    PERIOD = 3      # Time-limited window
-    CIRCLE = 4      # Recurring schedule
+    PERMANENT = 1
+    COUNT = 2
+    PERIOD = 3
+    CIRCLE = 4
 
 
 class PwdOperateType(IntEnum):
-    CLEAR = 1       # Delete all passcodes
-    ADD = 2         # Add a passcode
-    REMOVE_ONE = 3  # Delete one passcode
-    MODIFY = 5      # Update a passcode
+    CLEAR = 1
+    ADD = 2
+    REMOVE_ONE = 3
+    MODIFY = 5
 
 
 class ICOperate(IntEnum):
@@ -84,7 +81,6 @@ class ICOperate(IntEnum):
     MODIFY = 5
     FR_SEARCH = 6
     WRITE_FR = 7
-    # Status codes returned inside the ADD response
     STATUS_ADD_SUCCESS = 0x01
     STATUS_ENTER_ADD_MODE = 0x02
     STATUS_FR_PROGRESS = 0x03
@@ -146,3 +142,58 @@ class FeatureValue(IntEnum):
     CYCLIC_PASSCODE_CAN_RECOVERY = 40
     WIRELESS_KEY_FOB = 41
     ACCESSORY_BATTERY = 42
+
+
+class LogOperate(IntEnum):
+    OPERATE_TYPE_MOBILE_UNLOCK = 1
+    OPERATE_TYPE_KEYBOARD_PASSWORD_UNLOCK = 4
+    OPERATE_TYPE_KEYBOARD_MODIFY_PASSWORD = 5
+    OPERATE_TYPE_KEYBOARD_REMOVE_SINGLE_PASSWORD = 6
+    OPERATE_TYPE_ERROR_PASSWORD_UNLOCK = 7
+    OPERATE_TYPE_KEYBOARD_REMOVE_ALL_PASSWORDS = 8
+    OPERATE_TYPE_KEYBOARD_PASSWORD_KICKED = 9
+    OPERATE_TYPE_USE_DELETE_CODE = 10
+    OPERATE_TYPE_PASSCODE_EXPIRED = 11
+    OPERATE_TYPE_SPACE_INSUFFICIENT = 12
+    OPERATE_TYPE_PASSCODE_IN_BLACK_LIST = 13
+    OPERATE_TYPE_DOOR_REBOOT = 14
+    OPERATE_TYPE_ADD_IC = 15
+    OPERATE_TYPE_CLEAR_IC_SUCCEED = 16
+    OPERATE_TYPE_IC_UNLOCK_SUCCEED = 17
+    OPERATE_TYPE_DELETE_IC_SUCCEED = 18
+    OPERATE_TYPE_BONG_UNLOCK_SUCCEED = 19
+    OPERATE_TYPE_FR_UNLOCK_SUCCEED = 20
+    OPERATE_TYPE_ADD_FR = 21
+    OPERATE_TYPE_FR_UNLOCK_FAILED = 22
+    OPERATE_TYPE_DELETE_FR_SUCCEED = 23
+    OPERATE_TYPE_CLEAR_FR_SUCCEED = 24
+    OPERATE_TYPE_IC_UNLOCK_FAILED = 25
+    OPERATE_BLE_LOCK = 26
+    OPERATE_KEY_UNLOCK = 27
+    GATEWAY_UNLOCK = 28
+    ILLAGEL_UNLOCK = 29
+    DOOR_SENSOR_LOCK = 30
+    DOOR_SENSOR_UNLOCK = 31
+    DOOR_GO_OUT = 32
+    FR_LOCK = 33
+    PASSCODE_LOCK = 34
+    IC_LOCK = 35
+    OPERATE_KEY_LOCK = 36
+    REMOTE_CONTROL_KEY = 37
+    PASSCODE_UNLOCK_FAILED_LOCK_REVERSE = 38
+    IC_UNLOCK_FAILED_LOCK_REVERSE = 39
+    FR_UNLOCK_FAILED_LOCK_REVERSE = 40
+    APP_UNLOCK_FAILED_LOCK_REVERSE = 41
+    WIRELESS_KEY_FOB = 55
+    WIRELESS_KEY_PAD = 56
+
+
+UNLOCK_METHOD_MAP = {
+    LogOperate.OPERATE_TYPE_MOBILE_UNLOCK: "app",
+    LogOperate.OPERATE_TYPE_KEYBOARD_PASSWORD_UNLOCK: "pin",
+    LogOperate.OPERATE_TYPE_IC_UNLOCK_SUCCEED: "ic_card",
+    LogOperate.OPERATE_TYPE_FR_UNLOCK_SUCCEED: "fingerprint",
+    LogOperate.OPERATE_BLE_LOCK: "ble_lock",
+    LogOperate.OPERATE_KEY_UNLOCK: "mechanical_key",
+    LogOperate.GATEWAY_UNLOCK: "gateway",
+}
